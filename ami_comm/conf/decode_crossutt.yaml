@@ -1,0 +1,11 @@
+batchsize: 0
+beam-size: 10
+penalty: -0.0005
+maxlenratio: 0.0
+minlenratio: 0.0
+ctc-weight: 0.0
+lm-weight: 0.1
+# Cross utterance related
+# flvmodel: exp/external_rnnlm_crossutt/flvmodel.best
+prevlen: 72
+futurelen: 72

@@ -1,0 +1,9 @@
+batchsize: 0
+beam-size: 10
+penalty: 0.0
+maxlenratio: 0.0
+minlenratio: 0.0
+ctc-weight: 0.0
+lm-weight: 0.08
+coverage-penalty: 0.01
+eos-max-logit-delta: 1.0
