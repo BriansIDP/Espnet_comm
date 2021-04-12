@@ -69,7 +69,8 @@ class Decoder(torch.nn.Module, ScorerInterface):
         replace_sos=False,
         num_encs=1,
         wordemb=0, lm_odim=0, meetingKB=None, KBlextree=False, PtrGen=False,
-        PtrSche=0, PtrKBin=False, smoothprob=1.0, attn_dim=0, acousticonly=True
+        PtrSche=0, PtrKBin=False, smoothprob=1.0, attn_dim=0, acousticonly=True,
+        additive=False, ooKBemb=False
     ):
 
         torch.nn.Module.__init__(self)
@@ -83,10 +84,12 @@ class Decoder(torch.nn.Module, ScorerInterface):
 
         # gs534 - KB related
         self.meetingKB = meetingKB
+        self.bpeunk = char_list.index('<unk>') if '<unk>' in char_list else -1
         self.wordemb = wordemb
         self.ac_only = acousticonly
         self.useKBinput = False
         self.attn_dim = attn_dim if attn_dim != 0 else self.dunits
+        self.additive = additive
         embdim = 0
         if meetingKB is not None:
             self.useKBinput = (not PtrGen or PtrKBin)
@@ -97,6 +100,9 @@ class Decoder(torch.nn.Module, ScorerInterface):
                 self.Kproj = torch.nn.Linear(self.wordemb+self.dunits, self.attn_dim)
             else:
                 self.Kproj = torch.nn.Linear(lm_odim+self.dunits, self.attn_dim)
+            if self.additive:
+                self.AttnProj_1 = torch.nn.Linear(self.attn_dim*2, self.attn_dim*2)
+                self.AttnProj_2 = torch.nn.Linear(self.attn_dim*2, 1)
             self.pointer_gate = torch.nn.Linear(self.attn_dim+self.dunits if self.ac_only else self.attn_dim*2, 1)
             embdim = self.attn_dim
         self.KBlextree = KBlextree
@@ -104,6 +110,7 @@ class Decoder(torch.nn.Module, ScorerInterface):
         self.epoch = 0
         self.PtrSche = PtrSche
         self.smoothprob = smoothprob
+        self.ooKBemb = ooKBemb
         # self.KBlossfactor = KBlossfactor
 
         self.decoder = torch.nn.ModuleList()
@@ -173,16 +180,28 @@ class Decoder(torch.nn.Module, ScorerInterface):
                 )
         return z_list, c_list
 
-    def get_meetingKB_emb(self, query, meeting_KB, meeting_mask, ptr_inds, factor=1.0, att_labs_seq=None):
+    def get_meetingKB_emb(self, query, meeting_KB, meeting_mask, ptr_inds, factor=1.0,
+                          att_labs_seq=None, unk_mask=None):
         # (odim, dunits) * (utt, KBsize, odim) -> (utt, KBsize, dunits)
         meeting_KB_char = torch.einsum('ij,kli->klj', self.embed.weight.data, ptr_inds)
+        if unk_mask is not None and self.bpeunk != -1:
+            expand_unk = self.embed.weight.data[self.bpeunk].view(1, 1, -1) * unk_mask.float().unsqueeze(-1)
+            meeting_KB_char = meeting_KB_char + expand_unk
         if self.wordemb > 0:
             meeting_KB = self.dropout_KB(self.CharembProj(meeting_KB))
         meeting_KB = torch.cat([meeting_KB, meeting_KB_char], dim=-1)
         meeting_KB = self.dropout_KB(self.Kproj(meeting_KB))
-        # utt * KBsize * wordemb, utt * wordemb -> utt * KBsize
-        KBweight = torch.einsum('ijk,ik->ij', meeting_KB, query)
-        KBweight = KBweight / math.sqrt(query.size(-1))
+        if self.additive:
+            query = query.unsqueeze(1).repeat(1, meeting_KB.size(1), 1)
+            # utt * KBsize * dunits
+            KBweight = self.AttnProj_1(torch.cat([query, meeting_KB], dim=-1))
+            # utt * KBsize
+            KBweight = self.AttnProj_2(torch.tanh(KBweight)).squeeze(-1)
+        else:
+            # utt * KBsize * wordemb, utt * wordemb -> utt * KBsize
+            KBweight = torch.einsum('ijk,ik->ij', meeting_KB, query)
+            KBweight = KBweight / (math.sqrt(query.size(-1)))
+            # KBweight = KBweight / query.size(-1)
         KBweight.masked_fill_(to_device(self, meeting_mask), -1e9)
         KBweight = torch.nn.functional.softmax(KBweight, dim=-1)
         # utt * KBsize * dunits, utt * KBsize -> utt * dunits
@@ -450,8 +469,10 @@ class Decoder(torch.nn.Module, ScorerInterface):
                 if self.KBlextree:
                     lex_ind = lex_embs[:,i]
                     KBembedding = meeting_KB.gather(1, lex_ind.unsqueeze(-1).expand(-1, -1, meeting_KB.size(-1)))
+                    # for unk symbol
+                    unk_mask = (lex_ind == self.meetingKB.unkidx) if self.ooKBemb else None
                     KBembedding, ptr_dist = self.get_meetingKB_emb(query, KBembedding, lex_masks[:,i], ptr_inds[:,i],
-                                                                   factor, att_labs_i)
+                                                                   factor, att_labs_i, unk_mask)
                 else:
                     print('To be implemented')
                 # pointer generator distribution
@@ -462,15 +483,17 @@ class Decoder(torch.nn.Module, ScorerInterface):
                     ptr_dist_all.append(ptr_dist.unsqueeze(1))
                     p_gen_all.append(p_gen * self.smoothprob)
 
+            if self.useKBinput:
+                z_out = self.post_LSTM_proj(torch.cat((self.dropout_dec[-1](z_list[-1]), KBembedding), dim=-1))
+            else:
+                z_out = self.dropout_dec[-1](z_list[-1])
+
             if self.context_residual:
                 z_all.append(
-                    torch.cat((self.dropout_dec[-1](z_list[-1]), att_c), dim=-1)
+                    torch.cat((z_out, att_c), dim=-1)
                 )  # utt x (zdim + hdim)
-            elif self.useKBinput:
-                z_out = self.post_LSTM_proj(torch.cat((self.dropout_dec[-1](z_list[-1]), KBembedding), dim=-1))
-                z_all.append(z_out)
             else:
-                z_all.append(self.dropout_dec[-1](z_list[-1]))  # utt x (zdim)
+                z_all.append(z_out)  # utt x (zdim)
 
         z_all = torch.stack(z_all, dim=1).view(batch * olength, -1)
         # compute loss
@@ -640,7 +663,7 @@ class Decoder(torch.nn.Module, ScorerInterface):
         # gs534 - get meeting KBs
         if meeting_info is not None and meeting_info != []:
             # leave the first entry for OOV
-            # self.char_emb_matrix.weight.data[0] *= 0
+            # self.char_emb_matrix.weight.data[self.meetingKB.vocab.sym2idx['<blank>']] *= 0
             meeting_KB = self.char_emb_matrix.weight.data[meeting_info[0]]
             # Do projection only when using dot-product attention
             if self.KBlextree:
@@ -707,14 +730,17 @@ class Decoder(torch.nn.Module, ScorerInterface):
                             vy, hyp['lextree'], meeting_info[2][0])
                         if self.ac_only:
                             query = self.dropout_KB(self.Qproj(ey))
+                            # query = self.dropout_KB(self.Qproj(torch.cat([self.dropout_emb(self.embed(vy)), att_c*0], dim=1)))
                         else:
                             # query = z_list[-1]
                             query = self.dropout_KB(self.Qproj(torch.cat([att_c, z_list[-1]], dim=-1)))
                         KBembedding = meeting_KB[0][lex_inds]
                         # KBmaxlen = lex_inds.size(1) if self.fusion != 'select' else self.meetingKB.maxlen
                         KBmaxlen = self.meetingKB.maxlen
+                        # unk symbol mask
+                        unk_mask = (lex_inds == self.meetingKB.unkidx) if self.ooKBemb else None
                         char_mask = to_device(self, self.get_next_char_matrix(tree_track, KBmaxlen))
-                        KBembedding, ptr_dist = self.get_meetingKB_emb(query, KBembedding, lex_mask, char_mask.unsqueeze(0))
+                        KBembedding, ptr_dist = self.get_meetingKB_emb(query, KBembedding, lex_mask, char_mask.unsqueeze(0), unk_mask=unk_mask)
                         # debug - gs534
                         if not ptr_mask:
                             p_gen = 0
@@ -726,7 +752,12 @@ class Decoder(torch.nn.Module, ScorerInterface):
 
                 # get nbest local scores and their ids
                 if self.context_residual:
-                    decoder_output = torch.cat((self.dropout_dec[-1](z_list[-1]), att_c), dim=-1)
+                    if self.meetingKB is not None and self.useKBinput:
+                        decoder_output = torch.cat([self.dropout_dec[-1](z_list[-1]), KBembedding], dim=-1)
+                        decoder_output = self.post_LSTM_proj(decoder_output)
+                        decoder_output = torch.cat((decoder_output, att_c), dim=-1)
+                    else:
+                        decoder_output = torch.cat((self.dropout_dec[-1](z_list[-1]), att_c), dim=-1)
                 elif self.meetingKB is not None and self.useKBinput:
                     decoder_output = torch.cat([self.dropout_dec[-1](z_list[-1]), KBembedding], dim=-1)
                     decoder_output = self.post_LSTM_proj(decoder_output)
@@ -740,8 +771,11 @@ class Decoder(torch.nn.Module, ScorerInterface):
                 else:
                     p_gen = p_gen * self.smoothprob
                     model_dist = F.softmax(logits, dim=-1)
+                    # if len(hyp['yseq']) > 1 and self.char_list[hyp['yseq'][-2]] == 'NE' and self.char_list[hyp['yseq'][-1]] == 'S':
+                    #     import pdb; pdb.set_trace()
                     ptr_dist = torch.einsum('ij,jk->ik', ptr_dist, char_mask)
                     ptr_gen_complement = (1 - ptr_dist.sum(1, keepdim=True)) * p_gen
+                    # print(self.char_list[hyp['yseq'][-1]])
                     # print(ptr_dist.sum()*p_gen)
                     local_att_scores = torch.log(ptr_dist * p_gen + model_dist * (1 - p_gen + ptr_gen_complement))
 
@@ -1515,5 +1549,7 @@ def decoder_for(args, odim, sos, eos, att, labeldist, meetingKB=None):
         getattr(args, "PtrKBin", False),
         getattr(args, "smoothprob", 1.0),
         getattr(args, "attn_dim", args.dunits),
-        getattr(args, "acousticonly", True)
+        getattr(args, "acousticonly", True),
+        getattr(args, "additive-attn", False),
+        getattr(args, "ooKBemb", False)
     )  # use getattr to keep compatibility

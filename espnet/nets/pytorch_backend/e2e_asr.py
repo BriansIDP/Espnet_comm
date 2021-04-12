@@ -8,6 +8,7 @@ from itertools import groupby
 import logging
 import math
 import os
+import random
 
 import chainer
 from chainer import reporter
@@ -280,8 +281,8 @@ class E2E(ASRInterface, torch.nn.Module):
             if self.meeting_KB is not None and self.n_KBs == 0:
                 meeting_info = self.meeting_KB.get_meeting_KB(meetings)
             elif self.n_KBs > 0:
-                # progress every 5 epochs, hack here
-                KB_id = (self.dec.epoch // 5) * 10 + random.randint(0, 9)
+                # progress every 5 epochs
+                KB_id = (self.dec.epoch // 5) * 5 + random.randint(0, 4)
                 KBindex = min(KB_id, len(self.meeting_KB)-1) # random.randint(0, self.n_KBs - 1)
                 self.dec.meetingKB = self.meeting_KB[KBindex]
                 meeting_info = self.meeting_KB[KBindex].get_meeting_KB(meetings)

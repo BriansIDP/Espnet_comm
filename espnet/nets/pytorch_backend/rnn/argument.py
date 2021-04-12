@@ -205,6 +205,10 @@ def add_arguments_rnn_decoder_common(group):
                        help='Factor of KB loss')
     group.add_argument('--acousticonly', default=False, type=strtobool,
                        help='KB lookup only use acoustic information')
+    group.add_argument('--additive-attn', default=False, type=strtobool,
+                       help='KB lookup uses additive attention')
+    group.add_argument('--ooKBemb', default=False, type=strtobool,
+                       help='out-of-KB embedding for word piece')
     return group
 
 
