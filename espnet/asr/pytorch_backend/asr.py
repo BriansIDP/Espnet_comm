@@ -389,7 +389,6 @@ class CustomConverter(object):
 
         # perform padding and convert to tensor
         # currently only support real number
-        # import pdb; pdb.set_trace()
         if xs[0].dtype.kind == "c":
             xs_pad_real = pad_list(
                 [torch.from_numpy(x.real).float() for x in xs], 0
